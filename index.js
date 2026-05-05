@@ -98,7 +98,30 @@ const syncRouter      = require('./routes/sync');
 const processRouter   = require('./routes/process');
 
 const app = express();
-app.use(cors());
+
+// CORS: allow localhost dev + production Netlify frontend.
+// Add more origins to ALLOWED_ORIGINS in .env (comma-separated) to extend.
+const DEFAULT_ORIGINS = [
+  'http://localhost:5173',
+  'http://localhost:3000',
+  'http://127.0.0.1:5173',
+  'https://starlit-daifuku-1873eb.netlify.app',
+];
+const envOrigins = (process.env.ALLOWED_ORIGINS || '')
+  .split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+const allowedOrigins = Array.from(new Set([...DEFAULT_ORIGINS, ...envOrigins]));
+
+app.use(cors({
+  origin: function(origin, callback) {
+    // Allow non-browser clients (curl, server-to-server) with no Origin header
+    if (!origin) return callback(null, true);
+    if (allowedOrigins.includes(origin)) return callback(null, true);
+    return callback(new Error('CORS blocked for origin: ' + origin));
+  },
+  credentials: true,
+  exposedHeaders: ['X-Process-Stats', 'Content-Disposition'],
+}));
+
 app.use(express.json());
 
 app.use('/api/dashboard', dashboardRouter);
