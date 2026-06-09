@@ -3,7 +3,7 @@ const multer  = require('multer');
 const XLSX    = require('xlsx');
 const router  = express.Router();
 
-const { parseTimeToMinutes, formatMinutesToTime, randInt } = require('../utils/timeUtils');
+const { parseTimeToMinutes, formatMinutesToTime } = require('../utils/timeUtils');
 const normalizeStatus = require('../utils/normalizeStatus');
 
 const upload = multer({ storage: multer.memoryStorage() });
@@ -221,4 +221,3 @@ router.post('/', upload.single('file'), function(req, res) {
 });
 
 module.exports = router;
-

@@ -1,7 +1,8 @@
 require('dotenv').config();
-const express = require('express');
-const cors    = require('cors');
-const pool    = require('./db');
+const express         = require('express');
+const cors            = require('cors');
+const pool            = require('./db');
+const normalizeStatus = require('./utils/normalizeStatus');
 
 // ── Initialize DB first (async) before routes are loaded ──────────────
 async function initializeDatabase() {
@@ -34,35 +35,7 @@ async function initializeDatabase() {
       )
     `);
 
-    // Seed only if empty AND seeding is explicitly enabled (set SEED_DATA=true in .env)
-    const empCount = await pool.query('SELECT COUNT(*) as c FROM employees');
-    if (parseInt(empCount.rows[0].c) === 0 && process.env.SEED_DATA === 'true') {
-      console.log('Seeding initial data...');
-      const seedEmployees  = require('./seed/employees');
-      const seedAttendance = require('./seed/attendance');
-
-      for (const e of seedEmployees) {
-        await pool.query(
-          `INSERT INTO employees (name, code, branch, department, join_date) VALUES ($1, $2, $3, $4, $5)
-           ON CONFLICT (code) DO NOTHING`,
-          [e.name, e.code, e.branch || '', e.department, e.joinDate]
-        );
-      }
-
-      for (const a of seedAttendance) {
-        await pool.query(
-          `INSERT INTO attendance (employee_code, date, day, shift_in, shift_out, entry, exit_time, status)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
-           ON CONFLICT (employee_code, date) DO NOTHING`,
-          [a.code, a.date, a.day, a.shiftIn, a.shiftOut, a.entry, a.exit, a.status]
-        );
-      }
-
-      console.log(`Seeded ${seedEmployees.length} employees, ${seedAttendance.length} attendance records.`);
-    }
-
     // ── Normalize SPST values in any existing rows (WOP→WO, PHP→PH, etc.) ──
-    const normalizeStatus = require('./utils/normalizeStatus');
     const distinctStatuses = await pool.query(
       `SELECT DISTINCT status FROM attendance WHERE status IS NOT NULL AND status != ''`
     );
@@ -123,8 +96,8 @@ app.use(cors({
 }));
 
 app.use(express.json());
-app.get("/", (req, res) => {
-  res.send("HR Dashboard Backend API is Running Successfully 🚀");
+app.get('/', function(req, res) {
+  res.send('HR Dashboard Backend API is Running Successfully 🚀');
 });
 app.use('/api/dashboard', dashboardRouter);
 app.use('/api/employees', employeesRouter);
@@ -136,12 +109,12 @@ app.get('/api/health', function(req, res) { res.json({ status: 'ok' }); });
 const PORT = process.env.PORT || 3001;
 
 // Initialize database and start server
-initializeDatabase().then(() => {
+initializeDatabase().then(function() {
   app.listen(PORT, function() {
     console.log('HR Dashboard server ready at http://localhost:' + PORT);
-    console.log(`Database: ${process.env.DB_NAME || 'hr_dashboard'} (PostgreSQL)`);
+    console.log('Database: ' + (process.env.DB_NAME || 'hr_dashboard') + ' (PostgreSQL)');
   });
-}).catch(err => {
+}).catch(function(err) {
   console.error('Failed to start server:', err);
   process.exit(1);
 });
