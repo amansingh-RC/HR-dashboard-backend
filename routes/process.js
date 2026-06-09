@@ -3,212 +3,281 @@ const multer  = require('multer');
 const XLSX    = require('xlsx');
 const router  = express.Router();
 
-const { parseTimeToMinutes, formatMinutesToTime } = require('../utils/timeUtils');
+const { parseTimeToMinutes } = require('../utils/timeUtils');
 const normalizeStatus = require('../utils/normalizeStatus');
 
 const upload = multer({ storage: multer.memoryStorage() });
-
-const LATE_THRESHOLD_MIN = 40;
-const ARRV_RANDOM_OFFSET_RANGE = [1, 15];
-const DEPT_RANDOM_OFFSET_RANGE = [0, 15];
 
 function normalizeKey(str) {
   return String(str).toLowerCase().trim().replace(/[\s_/]+/g, '');
 }
 
-function findKey(row, target) {
-  const keys = Object.keys(row);
-  for (const k of keys) {
-    if (normalizeKey(k) === target) return k;
+const MIN_PER_DAY = 24 * 60;
+
+// ---- Configurable OT-distribution constraints (point 7) ----
+const OT_CONFIG = {
+  maxOtPerDayMin:  180,             // max OT minutes allowed on a single day (avoids extremes)
+  minArrivalMin:   5 * 60,          // arrival can never be earlier than 5:00 AM
+  maxDepartureMin: 23 * 60 + 30,    // departure can never be later than 11:30 PM
+  jitter:          0.40,            // +/-40% day-to-day variation (naturalness)
+  noOtMaxWorkMin:  9.5 * 60,        // OT=0 employees: worked hours must stay <= 9.5h
+};
+
+// Distribute `totalMin` overtime minutes across `n` eligible days so that:
+//  - the sum is EXACTLY min(totalMin, n * maxPerDay)  (point 1)
+//  - it is spread over every day, never dumped on one  (point 2)
+//  - it looks natural via random per-day weights        (points 3, 6)
+//  - no single day exceeds maxPerDay                    (points 5, 7)
+function distributeOt(totalMin, n, maxPerDay, jitter) {
+  const alloc = new Array(n).fill(0);
+  if (n === 0 || totalMin <= 0) return alloc;
+
+  const feasible = Math.min(totalMin, n * maxPerDay);
+
+  const weights = [];
+  let wsum = 0;
+  for (let i = 0; i < n; i++) {
+    const w = 1 + (Math.random() * 2 - 1) * jitter; // 1 +/- jitter
+    weights.push(w);
+    wsum += w;
   }
-  return null;
+  for (let i = 0; i < n; i++) {
+    let v = Math.round(feasible * weights[i] / wsum);
+    if (v > maxPerDay) v = maxPerDay;
+    if (v < 0) v = 0;
+    alloc[i] = v;
+  }
+
+  // Correct rounding so the total is EXACT, respecting [0, maxPerDay].
+  let diff = feasible - alloc.reduce((a, b) => a + b, 0);
+  let guard = 0;
+  while (diff !== 0 && guard++ < 1000000) {
+    const i = Math.floor(Math.random() * n);
+    if (diff > 0 && alloc[i] < maxPerDay) { alloc[i]++; diff--; }
+    else if (diff < 0 && alloc[i] > 0)    { alloc[i]--; diff++; }
+  }
+  return alloc;
 }
 
-function findDeptExitKey(row) {
-  const keys = Object.keys(row);
-  const hasDepartment = keys.some(function(k) {
-    return normalizeKey(k) === 'department';
-  });
-
-  if (!hasDepartment) return null;
-
-  for (const k of keys) {
-    if (normalizeKey(k) === 'dept') return k;
-  }
-  return null;
-}
-
+// POST /api/process
+// Works on the uploaded sheet IN PLACE so every original cell format
+// (Date = d-mmm-yy, SHIFT IN/OUT/ARRV/DEPT = h:mm AM/PM, WORK/OT = General)
+// is preserved. We only touch SPST, ARRV, DEPT, WORK and OT Hours cells.
 router.post('/', upload.single('file'), function(req, res) {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
 
   try {
-    const workbook = XLSX.read(req.file.buffer, {
-      type: 'buffer',
-      cellDates: false,
-      raw: true
-    });
-
+    const workbook  = XLSX.read(req.file.buffer, { type: 'buffer', cellNF: true });
     const sheetName = workbook.SheetNames[0];
-    const sheet = workbook.Sheets[sheetName];
-    const rows = XLSX.utils.sheet_to_json(sheet, { defval: '', raw: true });
+    const sheet     = workbook.Sheets[sheetName];
 
-    if (rows.length === 0) {
+    if (!sheet || !sheet['!ref']) {
       return res.status(400).json({ error: 'Excel file is empty or has no data rows.' });
     }
 
-    let arrvFixed = 0;
-    let deptFixed = 0;
-    let dpRows = 0;
-    let woPhRows = 0;
-    let spstNormalized = 0;
+    const range = XLSX.utils.decode_range(sheet['!ref']);
 
-    for (const row of rows) {
-      const spstKey = findKey(row, 'spst') || findKey(row, 'status');
-      if (!spstKey) continue;
+    // --- Map header names -> column index (order-independent) ---
+    const colOf = {};
+    for (let C = range.s.c; C <= range.e.c; C++) {
+      const hc = sheet[XLSX.utils.encode_cell({ r: range.s.r, c: C })];
+      if (hc && hc.v != null && String(hc.v).trim() !== '') {
+        colOf[normalizeKey(hc.v)] = C;
+      }
+    }
+    const pick = function() {
+      for (const name of arguments) {
+        if (colOf[name] !== undefined) return colOf[name];
+      }
+      return undefined;
+    };
 
-      const status = String(row[spstKey] || '').toUpperCase().trim();
-      const normalizedStatus = normalizeStatus(status);
+    const hasDepartment = colOf.department !== undefined;
+    const col = {
+      empKey:   pick('employeecode', 'code', 'employeename', 'name'),
+      spst:     pick('spst', 'status'),
+      shiftIn:  pick('shiftin'),
+      shiftOut: pick('shiftout'),
+      arrv:     pick('arrv', 'arrival', 'entry'),
+      // DEPT is a departure TIME only when a separate Department column exists
+      dept:     hasDepartment ? pick('dept') : undefined,
+      work:     pick('work'),
+      ot:       pick('othours'),
+    };
 
-      // Normalize SPST column in the output
-      if (normalizedStatus !== status) {
-        row[spstKey] = normalizedStatus;
+    if (col.spst === undefined) {
+      return res.status(400).json({ error: 'No SPST / Status column found in the sheet.' });
+    }
+
+    const cellAt = function(R, C) {
+      return C === undefined ? undefined : sheet[XLSX.utils.encode_cell({ r: R, c: C })];
+    };
+    const readMin = function(R, C) {
+      const c = cellAt(R, C);
+      return c ? parseTimeToMinutes(c.v) : null;
+    };
+    const wrapDay = function(m) {
+      return ((m % MIN_PER_DAY) + MIN_PER_DAY) % MIN_PER_DAY;
+    };
+    // Get a cell, creating it (with a number format) if it does not exist yet.
+    const ensureCell = function(R, C, z) {
+      const addr = XLSX.utils.encode_cell({ r: R, c: C });
+      let c = sheet[addr];
+      if (!c) c = sheet[addr] = { t: 'n', z: z };
+      return c;
+    };
+    // Write a time value (minutes-since-midnight) into a cell, keeping its format.
+    const writeTime = function(cell, minutes) {
+      cell.v = wrapDay(minutes) / MIN_PER_DAY;
+      cell.t = 'n';
+      delete cell.w;
+    };
+    // Write the worked hours (DEPT - ARRV) as DECIMAL hours, e.g. 8h 30m -> 8.5.
+    const writeWork = function(R, minutes) {
+      if (col.work === undefined) return;
+      let worked = minutes;
+      if (worked < 0) worked += MIN_PER_DAY;
+      const cell = ensureCell(R, col.work, 'General');
+      cell.v = Number((worked / 60).toFixed(2));
+      cell.t = 'n';
+      delete cell.w;
+    };
+    const zeroCell = function(cell) {
+      if (!cell) return;
+      cell.v = 0; cell.t = 'n';
+      if (!cell.z) cell.z = 'General';
+      delete cell.w;
+    };
+    const blankCell = function(cell) {
+      if (!cell) return;
+      cell.v = ''; cell.t = 's';
+      delete cell.w;
+    };
+
+    let arrvFixed = 0, deptFixed = 0, spstNormalized = 0, workUpdated = 0;
+
+    // group employeeKey -> { ot, days:[{R, siMin, soMin}] }
+    const employees = new Map();
+
+    // ===== PASS 1: normalize SPST, blank WO/PH, zero OT, collect eligible DP days =====
+    for (let R = range.s.r + 1; R <= range.e.r; R++) {
+      const spstCell = cellAt(R, col.spst);
+      if (!spstCell) continue;
+
+      const status = String(spstCell.v || '').toUpperCase().trim();
+      const ns     = normalizeStatus(status);
+
+      // 1) Normalize SPST in place
+      if (ns && ns !== status) {
+        spstCell.v = ns;
+        spstCell.t = 's';
+        delete spstCell.w;
         spstNormalized++;
       }
 
-      // Handle WO and PH: blank out ARRV and DEPT
-      if (normalizedStatus === 'WO' || normalizedStatus === 'PH') {
-        const arrvKey = findKey(row, 'arrv') || findKey(row, 'arrival') || findKey(row, 'entry');
-        const deptKey = findDeptExitKey(row);
+      const otCell   = cellAt(R, col.ot);
+      const arrvCell = cellAt(R, col.arrv);
+      const deptCell = cellAt(R, col.dept);
 
-        if (arrvKey && row[arrvKey]) {
-          row[arrvKey] = '';
-          woPhRows++;
-        }
-        if (deptKey && row[deptKey]) {
-          row[deptKey] = '';
-          woPhRows++;
-        }
+      // WO / PH days: blank ARRV & DEPT, WORK -> 0, OT -> 0.
+      if (ns === 'WO' || ns === 'PH') {
+        blankCell(arrvCell);
+        blankCell(deptCell);
+        writeWork(R, 0);
+        zeroCell(otCell);
         continue;
       }
 
-      // Original DP processing logic
-      if (status !== 'DP') continue;
+      const otVal = otCell ? parseFloat(otCell.v) : NaN; // capture BEFORE zeroing
+      zeroCell(otCell);                                  // OT Hours column -> 0 in output
 
-      dpRows++;
+      const siMin = readMin(R, col.shiftIn);
+      const soMin = readMin(R, col.shiftOut);
 
-      const shiftInKey = findKey(row, 'shiftin');
-      const shiftOutKey = findKey(row, 'shiftout');
-      const arrvKey = findKey(row, 'arrv') || findKey(row, 'arrival') || findKey(row, 'entry');
-      const deptKey = findDeptExitKey(row);
+      // Eligible = a present day (status contains DP) with a known shift.
+      const eligible = ns.indexOf('DP') !== -1 && siMin !== null && soMin !== null;
 
-      const shiftInMin = shiftInKey ? parseTimeToMinutes(row[shiftInKey]) : null;
-      const shiftOutMin = shiftOutKey ? parseTimeToMinutes(row[shiftOutKey]) : null;
-      const arrvMin = arrvKey ? parseTimeToMinutes(row[arrvKey]) : null;
-      const deptMin = deptKey ? parseTimeToMinutes(row[deptKey]) : null;
-
-      // Calculate shift duration in minutes
-      let shiftDurationMin = null;
-      if (shiftInMin !== null && shiftOutMin !== null) {
-        shiftDurationMin = shiftOutMin - shiftInMin;
-        // Handle case where shift crosses midnight (e.g., 10 PM to 6 AM)
-        if (shiftDurationMin < 0) {
-          shiftDurationMin += 24 * 60; // Add 24 hours
+      if (eligible) {
+        const key = col.empKey !== undefined
+          ? String((cellAt(R, col.empKey) || {}).v || '').trim()
+          : '__all__';
+        let e = employees.get(key);
+        if (!e) { e = { ot: 0, days: [] }; employees.set(key, e); }
+        if (otVal > 0) e.ot = otVal; // monthly OT total (same on every row of the employee)
+        e.days.push({ R: R, siMin: siMin, soMin: soMin });
+      } else {
+        // Special / non-DP statuses that still carry a punch (OD, CO+, ABS, PL,
+        // LWP, ...): leave ARRV/DEPT as-is but keep WORK consistent with them.
+        const a = readMin(R, col.arrv);
+        const d = readMin(R, col.dept);
+        if (a !== null && d !== null) {
+          let w = d - a;
+          if (w < 0) w += MIN_PER_DAY;
+          writeWork(R, w);
+        } else {
+          writeWork(R, 0);
         }
       }
+    }
 
-      // Cap ARRV: should not exceed shift duration from SHIFT IN
-      // Also cap to max 40 minutes late
-      if (shiftInMin !== null && arrvMin !== null && arrvKey && shiftDurationMin !== null) {
-        const diff = arrvMin - shiftInMin;
-        
-        // If ARRV crosses into next day (negative diff), keep as is
-        // If ARRV is more than 40 minutes after SHIFT IN, cap it at 40 minutes
-        if (diff > 0 && diff > LATE_THRESHOLD_MIN) {
-          const cappedMin = shiftInMin + LATE_THRESHOLD_MIN;
-          row[arrvKey] = formatMinutesToTime(cappedMin);
+    // ===== PASS 2: distribute each employee's monthly OT across their DP days =====
+    for (const e of employees.values()) {
+      const n = e.days.length;
+      const totalMin = Math.round((e.ot || 0) * 60);
+      const alloc = distributeOt(totalMin, n, OT_CONFIG.maxOtPerDayMin, OT_CONFIG.jitter);
+
+      for (let i = 0; i < n; i++) {
+        const d = e.days[i];
+        const dailyOt = alloc[i];               // minutes of OT for this day
+        const cut = Math.floor(dailyOt / 2);    // taken off arrival
+        const add = dailyOt - cut;              // added to departure
+
+        // Adjusted Arrival = Shift In - dailyOT/2  (clamped to min arrival)
+        let arr = d.siMin - cut;
+        if (arr < OT_CONFIG.minArrivalMin) arr = OT_CONFIG.minArrivalMin;
+
+        // Adjusted Departure = Shift Out + dailyOT/2  (clamped to max departure)
+        let dep = d.soMin + add;
+        if (dep > OT_CONFIG.maxDepartureMin) dep = OT_CONFIG.maxDepartureMin;
+
+        // OT = 0 employees: never let the worked time exceed 9.5h. If the shift
+        // itself is longer (e.g. 9:30 AM - 7:30 PM = 10h), trim the departure.
+        if ((e.ot || 0) <= 0) {
+          let worked = dep - arr;
+          if (worked < 0) worked += MIN_PER_DAY;
+          if (worked > OT_CONFIG.noOtMaxWorkMin) {
+            dep = arr + OT_CONFIG.noOtMaxWorkMin;
+          }
+        }
+
+        if (col.arrv !== undefined) {
+          writeTime(ensureCell(d.R, col.arrv, 'h:mm AM/PM'), arr);
           arrvFixed++;
         }
-        // If ARRV exceeds the shift duration, cap it to shift duration
-        else if (diff > shiftDurationMin) {
-          const cappedMin = shiftInMin + shiftDurationMin;
-          row[arrvKey] = formatMinutesToTime(cappedMin);
-          arrvFixed++;
-        }
-      }
-
-      // Cap DEPT: if more than 40 minutes after SHIFT OUT, or beyond shift duration, cap at SHIFT OUT
-      // If DEPT is "before" SHIFT OUT in raw minutes (e.g. DEPT = 01:00 AM, SHIFT OUT = 10:00 PM),
-      // treat DEPT as next-day post-midnight rather than an early departure.
-      if (shiftOutMin !== null && deptMin !== null && deptKey && shiftDurationMin !== null) {
-        let effectiveDeptMin = deptMin;
-        if (effectiveDeptMin < shiftOutMin) {
-          effectiveDeptMin += 24 * 60;
-        }
-        const diff = effectiveDeptMin - shiftOutMin;
-
-        if (diff > LATE_THRESHOLD_MIN || diff > shiftDurationMin) {
-          row[deptKey] = formatMinutesToTime(shiftOutMin);
+        if (col.dept !== undefined) {
+          writeTime(ensureCell(d.R, col.dept, 'h:mm AM/PM'), dep);
           deptFixed++;
         }
+
+        let worked = dep - arr;
+        if (worked < 0) worked += MIN_PER_DAY;
+        writeWork(d.R, worked);
+        workUpdated++;
       }
     }
 
-    const newSheet = XLSX.utils.json_to_sheet(rows);
-
-    // Force Excel display formats for date/time columns
-    const range = XLSX.utils.decode_range(newSheet['!ref']);
-
-    for (let R = 1; R <= range.e.r; ++R) {
-      // C = Join Date
-      const joinDateCell = XLSX.utils.encode_cell({ r: R, c: 2 });
-      if (newSheet[joinDateCell] && typeof newSheet[joinDateCell].v === 'number') {
-        newSheet[joinDateCell].z = 'dd-mm-yyyy';
-      }
-
-      // G = Date
-      const dateCell = XLSX.utils.encode_cell({ r: R, c: 6 });
-      if (newSheet[dateCell] && typeof newSheet[dateCell].v === 'number') {
-        newSheet[dateCell].z = 'dd-mm-yyyy';
-      }
-
-      // I = Shift In
-      const shiftInCell = XLSX.utils.encode_cell({ r: R, c: 8 });
-      if (newSheet[shiftInCell]) {
-        newSheet[shiftInCell].z = 'hh:mm AM/PM';
-      }
-
-      // J = Shift Out
-      const shiftOutCell = XLSX.utils.encode_cell({ r: R, c: 9 });
-      if (newSheet[shiftOutCell]) {
-        newSheet[shiftOutCell].z = 'hh:mm AM/PM';
-      }
-
-      // K = ARRV
-      const arrvCell = XLSX.utils.encode_cell({ r: R, c: 10 });
-      if (newSheet[arrvCell]) {
-        newSheet[arrvCell].z = 'hh:mm AM/PM';
-      }
-
-      // L = DEPT
-      const deptCell = XLSX.utils.encode_cell({ r: R, c: 11 });
-      if (newSheet[deptCell]) {
-        newSheet[deptCell].z = 'hh:mm AM/PM';
-      }
-    }
-
-    const newWorkbook = XLSX.utils.book_new();
-    XLSX.utils.book_append_sheet(newWorkbook, newSheet, sheetName);
-
-    const buffer = XLSX.write(newWorkbook, {
+    const buffer = XLSX.write(workbook, {
       type: 'buffer',
       bookType: 'xlsx',
-      cellStyles: true
+      cellStyles: true,
     });
 
     res.set({
       'Content-Type': 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
       'Content-Disposition': 'attachment; filename="RC_HR_Processed.xlsx"',
-      'X-Process-Stats': JSON.stringify({ dpRows, arrvFixed, deptFixed, woPhRows }),
+      'X-Process-Stats': JSON.stringify({
+        employees: employees.size, arrvFixed, deptFixed, spstNormalized, workUpdated,
+      }),
       'Access-Control-Expose-Headers': 'X-Process-Stats, Content-Disposition',
     });
 
