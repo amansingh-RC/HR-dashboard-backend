@@ -1,18 +1,22 @@
-require('dotenv').config();
-const pool = require('./db');
+require("dotenv").config();
+const pool = require("./db");
 
 async function clearData() {
   try {
-    console.log('Connecting to database...');
+    console.log("Connecting to database...");
 
-    const attResult = await pool.query('DELETE FROM attendance');
+    const attResult = await pool.query("DELETE FROM attendance");
     console.log(`✓ Deleted ${attResult.rowCount} attendance records`);
 
-    const empResult = await pool.query('DELETE FROM employees');
+    const empResult = await pool.query("DELETE FROM employees");
     console.log(`✓ Deleted ${empResult.rowCount} employees`);
 
-    const empCount = await pool.query('SELECT COUNT(*) as count FROM employees');
-    const attCount = await pool.query('SELECT COUNT(*) as count FROM attendance');
+    const empCount = await pool.query(
+      "SELECT COUNT(*) as count FROM employees",
+    );
+    const attCount = await pool.query(
+      "SELECT COUNT(*) as count FROM attendance",
+    );
 
     console.log(`\n✓ Database cleared successfully!`);
     console.log(`  - Employees remaining: ${empCount.rows[0].count}`);
@@ -20,7 +24,7 @@ async function clearData() {
 
     process.exit(0);
   } catch (err) {
-    console.error('Error clearing database:', err);
+    console.error("Error clearing database:", err);
     process.exit(1);
   }
 }

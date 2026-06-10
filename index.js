@@ -1,10 +1,9 @@
-require('dotenv').config();
-const express         = require('express');
-const cors            = require('cors');
-const pool            = require('./db');
-const normalizeStatus = require('./utils/normalizeStatus');
+require("dotenv").config();
+const express = require("express");
+const cors = require("cors");
+const pool = require("./db");
+const normalizeStatus = require("./utils/normalizeStatus");
 
-// ── Initialize DB first (async) before routes are loaded ──────────────
 async function initializeDatabase() {
   try {
     // Create employees table
@@ -37,18 +36,20 @@ async function initializeDatabase() {
 
     // ── Normalize SPST values in any existing rows (WOP→WO, PHP→PH, etc.) ──
     const distinctStatuses = await pool.query(
-      `SELECT DISTINCT status FROM attendance WHERE status IS NOT NULL AND status != ''`
+      `SELECT DISTINCT status FROM attendance WHERE status IS NOT NULL AND status != ''`,
     );
     let normalizedCount = 0;
     for (const row of distinctStatuses.rows) {
-      const original   = row.status;
+      const original = row.status;
       const normalized = normalizeStatus(original);
       if (normalized !== original) {
         const result = await pool.query(
           `UPDATE attendance SET status = $1 WHERE status = $2`,
-          [normalized, original]
+          [normalized, original],
         );
-        console.log(`  SPST: '${original}' → '${normalized}' (${result.rowCount} rows)`);
+        console.log(
+          `  SPST: '${original}' → '${normalized}' (${result.rowCount} rows)`,
+        );
         normalizedCount += result.rowCount;
       }
     }
@@ -56,65 +57,79 @@ async function initializeDatabase() {
       console.log(`Normalized ${normalizedCount} attendance row(s).`);
     }
 
-    console.log('Database initialized successfully');
+    console.log("Database initialized successfully");
   } catch (err) {
-    console.error('Database initialization error:', err);
+    console.error("Database initialization error:", err);
     process.exit(1);
   }
 }
 
 // ── Now require routes (tables exist) ──────────
-const dashboardRouter = require('./routes/dashboard');
-const employeesRouter = require('./routes/employees');
-const reportsRouter   = require('./routes/reports');
-const syncRouter      = require('./routes/sync');
-const processRouter   = require('./routes/process');
+const dashboardRouter = require("./routes/dashboard");
+const employeesRouter = require("./routes/employees");
+const reportsRouter = require("./routes/reports");
+const syncRouter = require("./routes/sync");
+const processRouter = require("./routes/process");
 
 const app = express();
 
 // CORS: allow localhost dev + production Netlify frontend.
 // Add more origins to ALLOWED_ORIGINS in .env (comma-separated) to extend.
 const DEFAULT_ORIGINS = [
-  'http://localhost:5173',
-  'http://localhost:3000',
-  'http://127.0.0.1:5173',
-  'https://royal-chain-hr-dashboard.vercel.app',
+  "http://localhost:5173",
+  "http://localhost:3000",
+  "http://127.0.0.1:5173",
+  "https://royal-chain-hr-dashboard.vercel.app",
 ];
-const envOrigins = (process.env.ALLOWED_ORIGINS || '')
-  .split(',').map(function(s) { return s.trim(); }).filter(Boolean);
+const envOrigins = (process.env.ALLOWED_ORIGINS || "")
+  .split(",")
+  .map(function (s) {
+    return s.trim();
+  })
+  .filter(Boolean);
 const allowedOrigins = Array.from(new Set([...DEFAULT_ORIGINS, ...envOrigins]));
 
-app.use(cors({
-  origin: function(origin, callback) {
-    // Allow non-browser clients (curl, server-to-server) with no Origin header
-    if (!origin) return callback(null, true);
-    if (allowedOrigins.includes(origin)) return callback(null, true);
-    return callback(new Error('CORS blocked for origin: ' + origin));
-  },
-  credentials: true,
-  exposedHeaders: ['X-Process-Stats', 'Content-Disposition'],
-}));
+app.use(
+  cors({
+    origin: function (origin, callback) {
+      // Allow non-browser clients (curl, server-to-server) with no Origin header
+      if (!origin) return callback(null, true);
+      if (allowedOrigins.includes(origin)) return callback(null, true);
+      return callback(new Error("CORS blocked for origin: " + origin));
+    },
+    credentials: true,
+    exposedHeaders: ["X-Process-Stats", "Content-Disposition"],
+  }),
+);
 
 app.use(express.json());
-app.get('/', function(req, res) {
-  res.send('HR Dashboard Backend API is Running Successfully 🚀');
+app.get("/", function (req, res) {
+  res.send("HR Dashboard Backend API is Running Successfully 🚀");
 });
-app.use('/api/dashboard', dashboardRouter);
-app.use('/api/employees', employeesRouter);
-app.use('/api/reports',   reportsRouter);
-app.use('/api/sync',      syncRouter);
-app.use('/api/process',   processRouter);
-app.get('/api/health', function(req, res) { res.json({ status: 'ok' }); });
+app.use("/api/dashboard", dashboardRouter);
+app.use("/api/employees", employeesRouter);
+app.use("/api/reports", reportsRouter);
+app.use("/api/sync", syncRouter);
+app.use("/api/process", processRouter);
+app.get("/api/health", function (req, res) {
+  res.json({ status: "ok" });
+});
 
 const PORT = process.env.PORT || 3001;
 
 // Initialize database and start server
-initializeDatabase().then(function() {
-  app.listen(PORT, function() {
-    console.log('HR Dashboard server ready at http://localhost:' + PORT);
-    console.log('Database: ' + (process.env.DB_NAME || 'hr_dashboard') + ' (PostgreSQL)');
+initializeDatabase()
+  .then(function () {
+    app.listen(PORT, function () {
+      console.log("HR Dashboard server ready at http://localhost:" + PORT);
+      console.log(
+        "Database: " +
+          (process.env.DB_NAME || "hr_dashboard") +
+          " (PostgreSQL)",
+      );
+    });
+  })
+  .catch(function (err) {
+    console.error("Failed to start server:", err);
+    process.exit(1);
   });
-}).catch(function(err) {
-  console.error('Failed to start server:', err);
-  process.exit(1);
-});
