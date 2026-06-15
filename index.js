@@ -72,9 +72,6 @@ const syncRouter = require("./routes/sync");
 const processRouter = require("./routes/process");
 
 const app = express();
-
-// CORS: allow localhost dev + production Netlify frontend.
-// Add more origins to ALLOWED_ORIGINS in .env (comma-separated) to extend.
 const DEFAULT_ORIGINS = [
   "http://localhost:5173",
   "http://localhost:3000",
@@ -92,7 +89,6 @@ const allowedOrigins = Array.from(new Set([...DEFAULT_ORIGINS, ...envOrigins]));
 app.use(
   cors({
     origin: function (origin, callback) {
-      // Allow non-browser clients (curl, server-to-server) with no Origin header
       if (!origin) return callback(null, true);
       if (allowedOrigins.includes(origin)) return callback(null, true);
       return callback(new Error("CORS blocked for origin: " + origin));
@@ -117,7 +113,6 @@ app.get("/api/health", function (req, res) {
 
 const PORT = process.env.PORT || 3001;
 
-// Initialize database and start server
 initializeDatabase()
   .then(function () {
     app.listen(PORT, function () {

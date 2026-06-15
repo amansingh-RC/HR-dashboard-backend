@@ -18,14 +18,14 @@ function normalizeKey(str) {
 const MIN_PER_DAY = 24 * 60;
 
 const OT_CONFIG = {
-  minOtHours: 1, // an OT day adds at least 1 whole hour
-  maxOtHours: 2, // an OT day adds at most 2 whole hours
+  minOtHours: 1,
+  maxOtHours: 2,
   minArrivalMin: 5 * 60,
   jitter: 0.4,
-  longShiftMin: 10 * 60, // "long" shift = 10h or more
-  noOtMaxWorkMin: 9.5 * 60, // long-shift non-OT day: worked must stay below 9.5h
-  noOtTrimRandomMin: 30, // when trimming, land 1..30 min below 9.5h (random, natural)
-  naturalWindowMin: 60, // keep original punch if within +/-60 min of shift, else clean to shift
+  longShiftMin: 10 * 60,
+  noOtMaxWorkMin: 9.5 * 60,
+  noOtTrimRandomMin: 30,
+  naturalWindowMin: 60,
 };
 
 function distributeOt(totalMin, n, minPerDay, maxPerDay, jitter) {
@@ -33,8 +33,6 @@ function distributeOt(totalMin, n, minPerDay, maxPerDay, jitter) {
   if (n <= 0 || totalMin <= 0) return alloc;
 
   const feasible = Math.min(totalMin, n * maxPerDay);
-
-  // How many days should carry OT? Each carries [minPerDay, maxPerDay].
   const kMin = Math.ceil(feasible / maxPerDay);
   const kMax = Math.min(n, Math.floor(feasible / minPerDay));
   let k, lo;
@@ -42,8 +40,6 @@ function distributeOt(totalMin, n, minPerDay, maxPerDay, jitter) {
     k = Math.min(n, Math.max(1, kMin));
     lo = Math.floor(feasible / k);
   } else {
-    // Pick the number of OT days RANDOMLY in the feasible range so the per-day
-    // chunks come out as a natural mix of 1 / 2 / 3 hours (not all identical).
     k = kMin + Math.floor(Math.random() * (kMax - kMin + 1));
     if (k < 1) k = 1;
     lo = minPerDay;
@@ -171,8 +167,6 @@ router.post("/", upload.single("file"), function (req, res) {
       cell.t = "n";
       delete cell.w;
     };
-    // WORK is written as an hours:minutes duration WITHOUT AM/PM (e.g. 8h 37m
-    // -> "8:37"). Zero-work days stay as a plain 0.
     const writeWork = function (R, minutes) {
       if (col.work === undefined) return;
       let worked = minutes;
@@ -259,9 +253,7 @@ router.post("/", upload.single("file"), function (req, res) {
           employees.set(key, e);
         }
         if (otVal > 0) e.ot = otVal;
-        // otOk = OT may be added to this day ONLY if SPST is exactly "DP"
-        // (not ABS/DP, PL/DP, etc.). Other present days are still cleaned but
-        // never receive overtime.
+
         e.days.push({ R: R, siMin: siMin, soMin: soMin, otOk: ns === "DP" });
       } else {
         const a = readMin(R, col.arrv);
@@ -277,9 +269,6 @@ router.post("/", upload.single("file"), function (req, res) {
     }
 
     for (const e of employees.values()) {
-      // OT is distributed in WHOLE HOURS (1 or 2 per day) and ONLY to days whose
-      // SPST is exactly "DP". The monthly OT is rounded to the nearest hour; any
-      // hours that do not fit (capacity = pure-DP days x 2h) are simply dropped.
       const totalHours = Math.round(e.ot || 0);
       const otDays = e.days.filter((d) => d.otOk);
       const alloc = distributeOt(
@@ -295,33 +284,24 @@ router.post("/", upload.single("file"), function (req, res) {
 
       for (let i = 0; i < e.days.length; i++) {
         const d = e.days[i];
-        const otHours = d.otHours || 0; // whole hours of OT for this day (0..2)
+        const otHours = d.otHours || 0;
 
-        // Original punches are still in the cells at this point (pass 1 did not
-        // touch eligible ARRV/DEPT) -> read them so we can keep the natural value.
         const origArr = readMin(d.R, col.arrv);
         const origDep = readMin(d.R, col.dept);
         const W = OT_CONFIG.naturalWindowMin;
 
-        // ARRV never receives OT: keep the original punch when it is sane
-        // (within +/-W of Shift In), else clean it to Shift In (drops AM/PM junk).
         let arr =
           origArr !== null && Math.abs(origArr - d.siMin) <= W
             ? origArr
             : d.siMin;
         if (arr < OT_CONFIG.minArrivalMin) arr = OT_CONFIG.minArrivalMin;
 
-        // DEPT: start from the cleaned original departure punch (natural value),
-        // then ADD the whole-hour OT for OT days (e.g. 9:45 PM + 1h -> 10:45 PM).
         let dep =
           origDep !== null && Math.abs(origDep - d.soMin) <= W
             ? origDep
             : d.soMin;
         if (otHours > 0) dep += otHours * 60;
 
-        // Condition 1: for employees whose actual shift is 10h or longer, on a
-        // day with NO OT the worked time must stay under 9.5h. If longer, trim the
-        // departure to a little below 9.5h (random, so trimmed days vary).
         const shiftLen =
           (((d.soMin - d.siMin) % MIN_PER_DAY) + MIN_PER_DAY) % MIN_PER_DAY;
         if (otHours === 0 && shiftLen >= OT_CONFIG.longShiftMin) {
