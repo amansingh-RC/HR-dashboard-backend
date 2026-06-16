@@ -20,10 +20,11 @@ const MIN_PER_DAY = 24 * 60;
 const OT_CONFIG = {
   minOtHours: 1,
   maxOtHours: 2,
-  minArrivalMin: 5 * 60,
+  arrvMaxLateMin: 20, // ARRV = Shift In + 0..20 min
   jitter: 0.4,
-  longShiftMin: 10 * 60,
-  noOtMaxWorkMin: 9.5 * 60,
+  otWorkedSlackMin: 10, // OT only on days whose worked is <= shift + 10 min
+  maxWorkMin: 10 * 60, // trim trigger: worked over 10h
+  trimTargetMin: 9.5 * 60, // ...is trimmed down to ~9.5h
   noOtTrimRandomMin: 30,
   naturalWindowMin: 60,
 };
@@ -239,6 +240,35 @@ router.post("/", upload.single("file"), function (req, res) {
       const siMin = readMin(R, col.shiftIn);
       const soMin = readMin(R, col.shiftOut);
 
+      // DP/ABS and ABS/DP: keep ARRV & DEPT as the original sheet, EXCEPT when the
+      // worked time goes over 9.5h -- then trim it back below 9.5h (randomised):
+      //   - ABS/DP -> trim the DEPT column (pull departure earlier)
+      //   - DP/ABS -> trim the ARRV column (push arrival later)
+      if (ns === "ABS/DP" || ns === "DP/ABS") {
+        const a = readMin(R, col.arrv);
+        const d = readMin(R, col.dept);
+        if (a !== null && d !== null) {
+          let w = d - a;
+          if (w < 0) w += MIN_PER_DAY;
+          if (w > OT_CONFIG.trimTargetMin) {
+            const target =
+              OT_CONFIG.trimTargetMin - randInt(1, OT_CONFIG.noOtTrimRandomMin);
+            if (ns === "ABS/DP") {
+              const deptCell = cellAt(R, col.dept);
+              if (deptCell) writeTime(deptCell, a + target); // new DEPT = ARRV + target
+            } else {
+              const arrvCell = cellAt(R, col.arrv);
+              if (arrvCell) writeTime(arrvCell, d - target); // new ARRV = DEPT - target
+            }
+            w = target;
+          }
+          writeWork(R, w);
+        } else {
+          writeWork(R, 0);
+        }
+        continue;
+      }
+
       const eligible =
         ns.indexOf("DP") !== -1 && siMin !== null && soMin !== null;
 
@@ -254,13 +284,68 @@ router.post("/", upload.single("file"), function (req, res) {
         }
         if (otVal > 0) e.ot = otVal;
 
-        e.days.push({ R: R, siMin: siMin, soMin: soMin, otOk: ns === "DP" });
+        const W = OT_CONFIG.naturalWindowMin;
+        const origDep = readMin(R, col.dept);
+        const shiftLen =
+          (((soMin - siMin) % MIN_PER_DAY) + MIN_PER_DAY) % MIN_PER_DAY;
+
+        // REQ 4: ARRV = Shift In + 0..20 min. (ABS/DP and DP/ABS were already
+        // handled above and never reach here.)
+        const arr = siMin + randInt(0, OT_CONFIG.arrvMaxLateMin);
+        writeTime(ensureCell(R, col.arrv, "h:mm AM/PM"), arr);
+        arrvFixed++;
+
+        // DEPT base = cleaned original departure (original if sane, else Shift Out).
+        let dep =
+          origDep !== null && Math.abs(origDep - soMin) <= W ? origDep : soMin;
+
+        // REQ 1: a base worked over 10h is trimmed down to ~9.5h (randomised).
+        let baseWorked = dep - arr;
+        if (baseWorked < 0) baseWorked += MIN_PER_DAY;
+        if (baseWorked > OT_CONFIG.maxWorkMin) {
+          dep =
+            arr +
+            OT_CONFIG.trimTargetMin -
+            randInt(0, OT_CONFIG.noOtTrimRandomMin);
+          baseWorked = dep - arr;
+          if (baseWorked < 0) baseWorked += MIN_PER_DAY;
+        }
+
+        // REQ 2/3 gate: OT only when SPST is exactly "DP" AND the (trimmed) worked
+        // time is at most 10 min above the shift hours.
+        const otOk =
+          ns === "DP" && baseWorked <= shiftLen + OT_CONFIG.otWorkedSlackMin;
+
+        e.days.push({
+          R: R,
+          arr: arr,
+          dep: dep,
+          otOk: otOk,
+          shiftLen: shiftLen,
+        });
       } else {
-        const a = readMin(R, col.arrv);
-        const d = readMin(R, col.dept);
+        const origArr = readMin(R, col.arrv);
+        const origDep = readMin(R, col.dept);
+        // REQ 4: present non-DP/ABS rows (OD, CO+, ...) also get ARRV = Shift In
+        // + 0..20 min. (ABS/DP and DP/ABS never reach here -- they are eligible.)
+        let a = origArr;
+        if (siMin !== null && (origArr !== null || origDep !== null)) {
+          a = siMin + randInt(0, OT_CONFIG.arrvMaxLateMin);
+          writeTime(ensureCell(R, col.arrv, "h:mm AM/PM"), a);
+          arrvFixed++;
+        }
+        const d = origDep;
         if (a !== null && d !== null) {
           let w = d - a;
           if (w < 0) w += MIN_PER_DAY;
+          // REQ 1: worked over 10h is trimmed down to ~9.5h.
+          if (w > OT_CONFIG.maxWorkMin) {
+            const target =
+              OT_CONFIG.trimTargetMin - randInt(0, OT_CONFIG.noOtTrimRandomMin);
+            const deptCell = cellAt(R, col.dept);
+            if (deptCell) writeTime(deptCell, a + target);
+            w = target;
+          }
           writeWork(R, w);
         } else {
           writeWork(R, 0);
@@ -269,56 +354,54 @@ router.post("/", upload.single("file"), function (req, res) {
     }
 
     for (const e of employees.values()) {
-      const totalHours = Math.round(e.ot || 0);
+      const otRaw = e.ot || 0;
+      let intHours = Math.floor(otRaw);
+      const fracMin = Math.round((otRaw - intHours) * 60); // e.g. 0.5h -> 30
+
       const otDays = e.days.filter((d) => d.otOk);
+      const dayOtMin = new Array(otDays.length).fill(0);
+      let pool = otDays.map((_, i) => i);
+
+      // The fractional part (e.g. 0.5h) is parked on ONE day that gets 1 whole
+      // hour, making it 1.5h -- never on a 2h day (that would exceed the 2h max).
+      let halfPlaced = false;
+      if (fracMin > 0 && intHours >= 1 && pool.length >= 1) {
+        const halfIdx = pool[Math.floor(Math.random() * pool.length)];
+        dayOtMin[halfIdx] = 60 + fracMin; // 1h + frac
+        intHours -= 1;
+        pool = pool.filter((i) => i !== halfIdx);
+        halfPlaced = true;
+      }
+
+      // Distribute the remaining WHOLE hours (1 or 2 per day) over the rest.
       const alloc = distributeOt(
-        totalHours,
-        otDays.length,
+        intHours,
+        pool.length,
         OT_CONFIG.minOtHours,
         OT_CONFIG.maxOtHours,
         OT_CONFIG.jitter,
       );
+      for (let j = 0; j < pool.length; j++) dayOtMin[pool[j]] += alloc[j] * 60;
+
+      // Lone fractional OT (no whole hours, e.g. 0.5h) -> put it on one day.
+      if (fracMin > 0 && !halfPlaced && otDays.length >= 1) {
+        dayOtMin[Math.floor(Math.random() * otDays.length)] += fracMin;
+      }
+
       otDays.forEach((d, i) => {
-        d.otHours = alloc[i];
+        d.otMin = dayOtMin[i];
       });
 
       for (let i = 0; i < e.days.length; i++) {
         const d = e.days[i];
-        const otHours = d.otHours || 0;
+        const otMin = d.otMin || 0;
 
-        const origArr = readMin(d.R, col.arrv);
-        const origDep = readMin(d.R, col.dept);
-        const W = OT_CONFIG.naturalWindowMin;
+        // REQ 5: on an OT day the worked time = shift hours + OT hours (start the
+        // day's value at 0, then add shift + OT). Non-OT days keep the cleaned/
+        // trimmed base departure.
+        const arr = d.arr;
+        let dep = otMin > 0 ? arr + d.shiftLen + otMin : d.dep;
 
-        let arr =
-          origArr !== null && Math.abs(origArr - d.siMin) <= W
-            ? origArr
-            : d.siMin;
-        if (arr < OT_CONFIG.minArrivalMin) arr = OT_CONFIG.minArrivalMin;
-
-        let dep =
-          origDep !== null && Math.abs(origDep - d.soMin) <= W
-            ? origDep
-            : d.soMin;
-        if (otHours > 0) dep += otHours * 60;
-
-        const shiftLen =
-          (((d.soMin - d.siMin) % MIN_PER_DAY) + MIN_PER_DAY) % MIN_PER_DAY;
-        if (otHours === 0 && shiftLen >= OT_CONFIG.longShiftMin) {
-          let worked = dep - arr;
-          if (worked < 0) worked += MIN_PER_DAY;
-          if (worked > OT_CONFIG.noOtMaxWorkMin) {
-            dep =
-              arr +
-              OT_CONFIG.noOtMaxWorkMin -
-              randInt(1, OT_CONFIG.noOtTrimRandomMin);
-          }
-        }
-
-        if (col.arrv !== undefined) {
-          writeTime(ensureCell(d.R, col.arrv, "h:mm AM/PM"), arr);
-          arrvFixed++;
-        }
         if (col.dept !== undefined) {
           writeTime(ensureCell(d.R, col.dept, "h:mm AM/PM"), dep);
           deptFixed++;
